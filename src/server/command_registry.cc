@@ -37,8 +37,8 @@ using absl::StrCat;
 using absl::StrSplit;
 
 CommandId::CommandId(const char* name, uint32_t mask, int8_t arity, int8_t first_key,
-                     int8_t last_key, int8_t step, uint32_t acl_categories)
-    : facade::CommandId(name, mask, arity, first_key, last_key, step, acl_categories) {
+                     int8_t last_key, uint32_t acl_categories)
+    : facade::CommandId(name, mask, arity, first_key, last_key, acl_categories) {
   if (mask & CO::ADMIN)
     opt_mask_ |= CO::NOSCRIPT;
 
@@ -62,19 +62,19 @@ void CommandId::Invoke(CmdArgList args, ConnectionContext* cntx) const {
   int64_t after = absl::GetCurrentTimeNanos();
 
   ServerState* ss = ServerState::tlocal();  // Might have migrated thread, read after invocation
-  int64_t execution_time_micro_s = (after - before) / 1000;
+  int64_t execution_time_usec = (after - before) / 1000;
 
   const auto* conn = cntx->conn();
   auto& ent = command_stats_[ss->thread_index()];
   // TODO: we should probably discard more commands here,
   // not just the blocking ones
   if (!(opt_mask_ & CO::BLOCKING) && conn != nullptr && ss->GetSlowLog().Capacity() > 0 &&
-      execution_time_micro_s > ss->log_slower_than_usec) {
+      execution_time_usec > ss->log_slower_than_usec) {
     ss->GetSlowLog().Add(name(), args, conn->GetName(), conn->RemoteEndpointStr(),
-                         execution_time_micro_s, after);
+                         execution_time_usec, after);
   }
   ++ent.first;
-  ent.second += execution_time_micro_s;
+  ent.second += execution_time_usec;
 }
 
 optional<facade::ErrorReply> CommandId::Validate(CmdArgList tail_args) const {
@@ -83,7 +83,7 @@ optional<facade::ErrorReply> CommandId::Validate(CmdArgList tail_args) const {
     return facade::ErrorReply{facade::WrongNumArgsError(name()), kSyntaxErrType};
   }
 
-  if (key_arg_step() == 2 && (tail_args.size() % 2) != 0) {
+  if ((opt_mask() & CO::INTERLEAVED_KEYS) && (tail_args.size() % 2) != 0) {
     return facade::ErrorReply{facade::WrongNumArgsError(name()), kSyntaxErrType};
   }
 
@@ -189,8 +189,12 @@ const char* OptName(CO::CommandOpt fl) {
       return "blocking";
     case HIDDEN:
       return "hidden";
+    case INTERLEAVED_KEYS:
+      return "interleaved-keys";
     case GLOBAL_TRANS:
       return "global-trans";
+    case STORE_LAST_KEY:
+      return "store-last-key";
     case VARIADIC_KEYS:
       return "variadic-keys";
     case NO_AUTOJOURNAL:

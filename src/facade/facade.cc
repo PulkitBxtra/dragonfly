@@ -27,11 +27,12 @@ constexpr size_t kSizeConnStats = sizeof(ConnectionStats);
 
 ConnectionStats& ConnectionStats::operator+=(const ConnectionStats& o) {
   // To break this code deliberately if we add/remove a field to this struct.
-  static_assert(kSizeConnStats == 136u);
+  static_assert(kSizeConnStats == 144u);
 
   ADD(read_buf_capacity);
   ADD(dispatch_queue_entries);
   ADD(dispatch_queue_bytes);
+  ADD(dispatch_queue_subscriber_bytes);
   ADD(pipeline_cmd_cache_bytes);
   ADD(io_read_cnt);
   ADD(io_read_bytes);
@@ -143,13 +144,12 @@ RedisReplyBuilder* ConnectionContext::operator->() {
 }
 
 CommandId::CommandId(const char* name, uint32_t mask, int8_t arity, int8_t first_key,
-                     int8_t last_key, int8_t step, uint32_t acl_categories)
+                     int8_t last_key, uint32_t acl_categories)
     : name_(name),
       opt_mask_(mask),
       arity_(arity),
       first_key_(first_key),
       last_key_(last_key),
-      step_key_(step),
       acl_categories_(acl_categories) {
 }
 

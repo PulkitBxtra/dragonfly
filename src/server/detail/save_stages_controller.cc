@@ -11,7 +11,6 @@
 #include "base/logging.h"
 #include "server/main_service.h"
 #include "server/script_mgr.h"
-#include "server/search/doc_index.h"
 #include "server/transaction.h"
 #include "strings/human_readable.h"
 
@@ -34,10 +33,6 @@ namespace {
 
 bool IsCloudPath(string_view path) {
   return absl::StartsWith(path, kS3Prefix);
-}
-
-string FormatTs(absl::Time now) {
-  return absl::FormatTime("%Y-%m-%dT%H:%M:%S", now, absl::LocalTimeZone());
 }
 
 // Create a directory and all its parents if they don't exist.
@@ -150,14 +145,10 @@ SaveStagesController::SaveStagesController(SaveStagesInputs&& inputs)
 }
 
 SaveStagesController::~SaveStagesController() {
-  service_->SwitchState(GlobalState::SAVING, GlobalState::ACTIVE);
 }
 
 GenericError SaveStagesController::Save() {
   if (auto err = BuildFullPath(); err)
-    return err;
-
-  if (auto err = SwitchState(); err)
     return err;
 
   if (auto err = InitResources(); err)
@@ -240,7 +231,7 @@ void SaveStagesController::SaveDfsSingle(EngineShard* shard) {
   auto& [snapshot, filename] = snapshots_[shard ? shard->shard_id() : shard_set->size()];
 
   SaveMode mode = shard == nullptr ? SaveMode::SUMMARY : SaveMode::SINGLE_SHARD;
-  auto glob_data = shard == nullptr ? GetGlobalData() : RdbSaver::GlobalData{};
+  auto glob_data = shard == nullptr ? RdbSaver::GetGlobalData(service_) : RdbSaver::GlobalData{};
 
   if (auto err = snapshot->Start(mode, filename, glob_data); err) {
     shared_err_ = err;
@@ -262,7 +253,7 @@ void SaveStagesController::SaveRdb() {
   if (!is_cloud_)
     filename += ".tmp";
 
-  if (auto err = snapshot->Start(SaveMode::RDB, filename, GetGlobalData()); err) {
+  if (auto err = snapshot->Start(SaveMode::RDB, filename, RdbSaver::GetGlobalData(service_)); err) {
     snapshot.reset();
     return;
   }
@@ -335,18 +326,11 @@ GenericError SaveStagesController::BuildFullPath() {
   if (auto err = ValidateFilename(filename, use_dfs_format_); err)
     return err;
 
-  SubstituteFilenameTsPlaceholder(&filename, FormatTs(start_time_));
+  SubstituteFilenamePlaceholders(
+      &filename, {.ts = "%Y-%m-%dT%H:%M:%S", .year = "%Y", .month = "%m", .day = "%d"});
+  filename = absl::FormatTime(filename.string(), start_time_, absl::LocalTimeZone());
   full_path_ = dir_path / filename;
   is_cloud_ = IsCloudPath(full_path_.string());
-  return {};
-}
-
-// Switch to saving state if in active state
-GenericError SaveStagesController::SwitchState() {
-  GlobalState new_state = service_->SwitchState(GlobalState::ACTIVE, GlobalState::SAVING);
-  if (new_state != GlobalState::SAVING && new_state != GlobalState::TAKEN_OVER)
-    return {make_error_code(errc::operation_in_progress),
-            StrCat(GlobalStateName(new_state), " - can not save database")};
   return {};
 }
 
@@ -375,32 +359,6 @@ void SaveStagesController::RunStage(void (SaveStagesController::*cb)(unsigned)) 
   } else {
     (this->*cb)(0);
   }
-}
-
-RdbSaver::GlobalData SaveStagesController::GetGlobalData() const {
-  StringVec script_bodies, search_indices;
-
-  {
-    auto scripts = service_->script_mgr()->GetAll();
-    script_bodies.reserve(scripts.size());
-    for (auto& [sha, data] : scripts)
-      script_bodies.push_back(move(data.body));
-  }
-
-#ifndef __APPLE__
-  {
-    shard_set->Await(0, [&] {
-      auto* indices = EngineShard::tlocal()->search_indices();
-      for (auto index_name : indices->GetIndexNames()) {
-        auto index_info = indices->GetIndex(index_name)->GetInfo();
-        search_indices.emplace_back(
-            absl::StrCat(index_name, " ", index_info.BuildRestoreCommand()));
-      }
-    });
-  }
-#endif
-
-  return RdbSaver::GlobalData{move(script_bodies), move(search_indices)};
 }
 
 }  // namespace detail

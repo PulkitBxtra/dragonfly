@@ -76,6 +76,56 @@ TEST_F(ZSetFamilyTest, ZRem) {
   EXPECT_THAT(Run({"zrange", "x", "(-inf", "(+inf", "byscore"}), "a");
 }
 
+TEST_F(ZSetFamilyTest, ZRandMember) {
+  auto resp = Run({
+      "zadd",
+      "x",
+      "1",
+      "a",
+      "2",
+      "b",
+      "3",
+      "c",
+  });
+  resp = Run({"ZRandMember", "x"});
+  ASSERT_THAT(resp, ArgType(RespExpr::STRING));
+  EXPECT_THAT(resp, "a");
+
+  resp = Run({"ZRandMember", "x", "2"});
+  ASSERT_THAT(resp, ArgType(RespExpr::ARRAY));
+  EXPECT_THAT(resp.GetVec(), UnorderedElementsAre("a", "b"));
+
+  resp = Run({"ZRandMember", "x", "0"});
+  ASSERT_THAT(resp, ArgType(RespExpr::ARRAY));
+  EXPECT_EQ(resp.GetVec().size(), 0);
+
+  resp = Run({"ZRandMember", "k"});
+  ASSERT_THAT(resp, ArgType(RespExpr::NIL));
+
+  resp = Run({"ZRandMember", "k", "2"});
+  ASSERT_THAT(resp, ArgType(RespExpr::ARRAY));
+  EXPECT_EQ(resp.GetVec().size(), 0);
+
+  resp = Run({"ZRandMember", "x", "-5"});
+  ASSERT_THAT(resp, ArrLen(5));
+  EXPECT_THAT(resp.GetVec(), ElementsAre("a", "b", "c", "a", "a"));
+
+  resp = Run({"ZRandMember", "x", "5"});
+  ASSERT_THAT(resp, ArrLen(3));
+  EXPECT_THAT(resp.GetVec(), UnorderedElementsAre("a", "b", "c"));
+
+  resp = Run({"ZRandMember", "x", "-5", "WITHSCORES"});
+  ASSERT_THAT(resp, ArrLen(10));
+  EXPECT_THAT(resp.GetVec(), ElementsAre("a", "1", "b", "2", "c", "3", "a", "1", "a", "1"));
+
+  resp = Run({"ZRandMember", "x", "3", "WITHSCORES"});
+  ASSERT_THAT(resp, ArrLen(6));
+  EXPECT_THAT(resp.GetVec(), UnorderedElementsAre("a", "1", "b", "2", "c", "3"));
+
+  resp = Run({"ZRandMember", "x", "3", "WITHSCORES", "test"});
+  EXPECT_THAT(resp, ErrArg("wrong number of arguments"));
+}
+
 TEST_F(ZSetFamilyTest, ZMScore) {
   Run({"zadd", "zms", "3.14", "a"});
   Run({"zadd", "zms", "42", "another"});
@@ -473,6 +523,23 @@ TEST_F(ZSetFamilyTest, ZInterStore) {
   EXPECT_THAT(resp.GetVec(), ElementsAre("b", "3"));
 }
 
+TEST_F(ZSetFamilyTest, ZInter) {
+  EXPECT_EQ(2, CheckedInt({"zadd", "z1", "1", "one", "2", "two"}));
+  EXPECT_EQ(3, CheckedInt({"zadd", "z2", "1", "one", "2", "two", "3", "three"}));
+  RespExpr resp;
+
+  resp = Run({"zinter", "2", "z1", "z2"});
+  EXPECT_THAT(resp, ArrLen(2));
+  EXPECT_THAT(resp.GetVec(), ElementsAre("one", "two"));
+
+  EXPECT_EQ(3, CheckedInt({"zadd", "z3", "1", "one", "2", "two", "3", "three"}));
+  EXPECT_EQ(3, CheckedInt({"zadd", "z4", "4", "four", "5", "five", "6", "six"}));
+  EXPECT_EQ(1, CheckedInt({"zadd", "z5", "6", "six"}));
+
+  resp = Run({"zinter", "3", "z3", "z4", "z5"});
+  EXPECT_THAT(resp, ArrLen(0));
+}
+
 TEST_F(ZSetFamilyTest, ZInterCard) {
   EXPECT_EQ(3, CheckedInt({"zadd", "z1", "1", "a", "2", "b", "3", "c"}));
   EXPECT_EQ(3, CheckedInt({"zadd", "z2", "2", "b", "3", "c", "4", "d"}));
@@ -795,6 +862,14 @@ TEST_F(ZSetFamilyTest, GeoSearch) {
           RespArray(ElementsAre("Dublin", DoubleArg(487.5619030644293), "3678981558208417",
                                 RespArray(ElementsAre(DoubleArg(6.2603), DoubleArg(53.3498))))))));
 
+  resp = Run({"GEOSEARCH", "America", "FROMMEMBER", "Madrid", "BYRADIUS", "700", "KM", "WITHCOORD",
+              "WITHDIST"});
+  EXPECT_THAT(resp, ErrArg("Member not found"));
+
+  resp = Run({"GEOSEARCH", "America", "FROMLONLAT", "13.4050", "52.5200", "BYBOX", "1000", "1000",
+              "KM", "WITHCOORD", "WITHDIST"});
+  EXPECT_THAT(resp, ErrArg("Member not found"));
+
   resp = Run({"GEOSEARCH", "Europe", "FROMLONLAT", "13.4050", "52.5200", "BYBOX", "1000", "1000",
               "KM", "WITHCOORD", "WITHDIST"});
   EXPECT_THAT(
@@ -837,4 +912,39 @@ TEST_F(ZSetFamilyTest, GeoSearch) {
           RespArray(ElementsAre("Lisbon", DoubleArg(502.20769462704084),
                                 RespArray(ElementsAre(DoubleArg(9.1427), DoubleArg(38.7369))))))));
 }
+
+TEST_F(ZSetFamilyTest, GeoRadiusByMember) {
+  EXPECT_EQ(10, CheckedInt({"geoadd",  "Europe",    "13.4050", "52.5200", "Berlin",   "3.7038",
+                            "40.4168", "Madrid",    "9.1427",  "38.7369", "Lisbon",   "2.3522",
+                            "48.8566", "Paris",     "16.3738", "48.2082", "Vienna",   "4.8952",
+                            "52.3702", "Amsterdam", "10.7522", "59.9139", "Oslo",     "23.7275",
+                            "37.9838", "Athens",    "19.0402", "47.4979", "Budapest", "6.2603",
+                            "53.3498", "Dublin"}));
+  auto resp = Run({"GEORADIUSBYMEMBER", "Europe", "Madrid", "700", "KM", "WITHCOORD", "WITHDIST"});
+  EXPECT_THAT(
+      resp,
+      RespArray(ElementsAre(
+          RespArray(ElementsAre(
+              "Madrid", "0", RespArray(ElementsAre("3.7038007378578186", "40.416799319406216")))),
+          RespArray(
+              ElementsAre("Lisbon", "502.20769462704084",
+                          RespArray(ElementsAre("9.142698347568512", "38.736900197448534")))))));
+  GTEST_SKIP();
+  EXPECT_EQ(
+      2, CheckedInt({"GEORADIUSBYMEMBER", "Europe", "Madrid", "700", "KM", "STORE", "store_key"}));
+
+  resp = Run({"ZRANGE", "store_key", "0", "-1"});
+  EXPECT_THAT(resp, RespArray(ElementsAre("Madrid", "Lisbon")));
+
+  resp = Run({"ZRANGE", "store_key", "0", "-1", "WITHSCORES"});
+  EXPECT_THAT(resp,
+              RespArray(ElementsAre("Madrid", "3471766229222696", "Lisbon", "3473121093062745")));
+
+  EXPECT_EQ(2, CheckedInt({"GEORADIUSBYMEMBER", "Europe", "Madrid", "700", "KM", "STOREDIST",
+                           "store_dist_key"}));
+
+  resp = Run({"ZRANGE", "store_dist_key", "0", "-1", "WITHSCORES"});
+  EXPECT_THAT(resp, RespArray(ElementsAre("Madrid", "0", "Lisbon", "502.20769462704084")));
+}
+
 }  // namespace dfly

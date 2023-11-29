@@ -64,6 +64,7 @@ class ZSetFamily {
   static void ZDiff(CmdArgList args, ConnectionContext* cntx);
   static void ZIncrBy(CmdArgList args, ConnectionContext* cntx);
   static void ZInterStore(CmdArgList args, ConnectionContext* cntx);
+  static void ZInter(CmdArgList args, ConnectionContext* cntx);
   static void ZInterCard(CmdArgList args, ConnectionContext* cntx);
   static void ZLexCount(CmdArgList args, ConnectionContext* cntx);
   static void ZPopMax(CmdArgList args, ConnectionContext* cntx);
@@ -71,6 +72,7 @@ class ZSetFamily {
   static void ZRange(CmdArgList args, ConnectionContext* cntx);
   static void ZRank(CmdArgList args, ConnectionContext* cntx);
   static void ZRem(CmdArgList args, ConnectionContext* cntx);
+  static void ZRandMember(CmdArgList args, ConnectionContext* cntx);
   static void ZScore(CmdArgList args, ConnectionContext* cntx);
   static void ZMScore(CmdArgList args, ConnectionContext* cntx);
   static void ZRangeByLex(CmdArgList args, ConnectionContext* cntx);
@@ -101,6 +103,7 @@ class ZSetFamily {
   static void GeoPos(CmdArgList args, ConnectionContext* cntx);
   static void GeoDist(CmdArgList args, ConnectionContext* cntx);
   static void GeoSearch(CmdArgList args, ConnectionContext* cntx);
+  static void GeoRadiusByMember(CmdArgList args, ConnectionContext* cntx);
 };
 
 }  // namespace dfly

@@ -19,6 +19,7 @@ extern "C" {
 
 #include "base/logging.h"
 #include "core/json_object.h"
+#include "facade/cmd_arg_parser.h"
 #include "server/acl/acl_commands_def.h"
 #include "server/command_registry.h"
 #include "server/error.h"
@@ -389,9 +390,10 @@ void SendJsonValue(ConnectionContext* cntx, const JsonType& j) {
   }
 }
 
-OpResult<string> OpGet(const OpArgs& op_args, string_view key,
-                       vector<pair<string_view, JsonExpression>> expressions, bool should_format,
-                       const OptString& indent, const OptString& new_line, const OptString& space) {
+OpResult<string> OpJsonGet(const OpArgs& op_args, string_view key,
+                           const vector<pair<string_view, optional<JsonExpression>>>& expressions,
+                           bool should_format, const OptString& indent, const OptString& new_line,
+                           const OptString& space) {
   OpResult<JsonType*> result = GetJson(op_args, key);
   if (!result) {
     return result.status();
@@ -427,22 +429,16 @@ OpResult<string> OpGet(const OpArgs& op_args, string_view key,
     }
   }
 
-  if (expressions.size() == 1) {
-    json out = expressions[0].second.evaluate(json_entry);
-    if (should_format) {
-      json_printable jp(out, options, indenting::indent);
-      std::stringstream ss;
-      jp.dump(ss);
-      return ss.str();
-    }
-
-    return out.as<string>();
-  }
+  auto eval_wrapped = [&json_entry](const optional<JsonExpression>& expr) {
+    return expr ? expr->evaluate(json_entry) : json_entry;
+  };
 
   json out;
-  for (auto& expr : expressions) {
-    json eval = expr.second.evaluate(json_entry);
-    out[expr.first] = eval;
+  if (expressions.size() == 1) {
+    out = eval_wrapped(expressions[0].second);
+  } else {
+    for (auto& [expr_str, expr] : expressions)
+      out[expr_str] = eval_wrapped(expr);
   }
 
   if (should_format) {
@@ -977,7 +973,7 @@ OpResult<vector<OptLong>> OpArrIndex(const OpArgs& op_args, string_view key,
 }
 
 // Returns string vector that represents the query result of each supplied key.
-vector<OptString> OpMGet(JsonExpression expression, const Transaction* t, EngineShard* shard) {
+vector<OptString> OpJsonMGet(JsonExpression expression, const Transaction* t, EngineShard* shard) {
   auto args = t->GetShardArgs(shard->shard_id());
   DCHECK(!args.empty());
   vector<OptString> response(args.size());
@@ -1275,7 +1271,7 @@ void JsonFamily::MGet(CmdArgList args, ConnectionContext* cntx) {
 
   auto cb = [&](Transaction* t, EngineShard* shard) {
     ShardId sid = shard->shard_id();
-    mget_resp[sid] = OpMGet(ParseJsonPath(path, &ec), t, shard);
+    mget_resp[sid] = OpJsonMGet(ParseJsonPath(path, &ec), t, shard);
     return OpStatus::OK;
   };
 
@@ -1785,54 +1781,50 @@ void JsonFamily::StrLen(CmdArgList args, ConnectionContext* cntx) {
 
 void JsonFamily::Get(CmdArgList args, ConnectionContext* cntx) {
   DCHECK_GE(args.size(), 1U);
-  string_view key = ArgS(args, 0);
+
+  facade::CmdArgParser parser{args};
+  string_view key = parser.Next();
 
   OptString indent;
   OptString new_line;
   OptString space;
-  vector<pair<string_view, JsonExpression>> expressions;
-  for (size_t i = 1; i < args.size(); ++i) {
-    string_view param = ArgS(args, i);
-    if (absl::EqualsIgnoreCase(param, "space")) {
-      if (++i >= args.size()) {
-        return (*cntx)->SendError(facade::WrongNumArgsError(cntx->cid->name()),
-                                  facade::kSyntaxErrType);
-      } else {
-        space = ArgS(args, i);
-        continue;
-      }
-    } else if (absl::EqualsIgnoreCase(param, "newline")) {
-      if (++i >= args.size()) {
-        return (*cntx)->SendError(facade::WrongNumArgsError(cntx->cid->name()),
-                                  facade::kSyntaxErrType);
-      } else {
-        new_line = ArgS(args, i);
-        continue;
-      }
-    } else if (absl::EqualsIgnoreCase(param, "indent")) {
-      if (++i >= args.size()) {
-        return (*cntx)->SendError(facade::WrongNumArgsError(cntx->cid->name()),
-                                  facade::kSyntaxErrType);
-      } else {
-        indent = ArgS(args, i);
-        continue;
+  vector<pair<string_view, optional<JsonExpression>>> expressions;
+
+  while (parser.HasNext()) {
+    if (parser.Check("SPACE").IgnoreCase().ExpectTail(1)) {
+      space = parser.Next();
+      continue;
+    }
+    if (parser.Check("NEWLINE").IgnoreCase().ExpectTail(1)) {
+      new_line = parser.Next();
+      continue;
+    }
+    if (parser.Check("INDENT").IgnoreCase().ExpectTail(1)) {
+      indent = parser.Next();
+      continue;
+    }
+
+    optional<JsonExpression> expr;
+    string_view expr_str = parser.Next();
+
+    if (expr_str != ".") {
+      error_code ec;
+      expr = ParseJsonPath(expr_str, &ec);
+      if (ec) {
+        LOG(WARNING) << "path '" << expr_str << "': Invalid JSONPath syntax: " << ec.message();
+        return (*cntx)->SendError(kSyntaxErr);
       }
     }
 
-    error_code ec;
-    JsonExpression expr = ParseJsonPath(param, &ec);
-
-    if (ec) {
-      LOG(WARNING) << "path '" << param << "': Invalid JSONPath syntax: " << ec.message();
-      return (*cntx)->SendError(kSyntaxErr);
-    }
-    expressions.emplace_back(param, move(expr));
+    expressions.emplace_back(expr_str, move(expr));
   }
+
+  if (auto err = parser.Error(); err)
+    return (*cntx)->SendError(err->MakeReply());
 
   bool should_format = (indent || new_line || space);
   auto cb = [&](Transaction* t, EngineShard* shard) {
-    return OpGet(t->GetOpArgs(shard), key, move(expressions), should_format, indent, new_line,
-                 space);
+    return OpJsonGet(t->GetOpArgs(shard), key, expressions, should_format, indent, new_line, space);
   };
 
   Transaction* trans = cntx->transaction;
@@ -1842,8 +1834,7 @@ void JsonFamily::Get(CmdArgList args, ConnectionContext* cntx) {
     (*cntx)->SendBulkString(*result);
   } else {
     if (result == facade::OpStatus::KEY_NOTFOUND) {
-      // Match what Redis returning
-      (*cntx)->SendNull();
+      (*cntx)->SendNull();  // Match Redis
     } else {
       (*cntx)->SendError(result.status());
     }
@@ -1860,36 +1851,34 @@ void JsonFamily::Get(CmdArgList args, ConnectionContext* cntx) {
 
 void JsonFamily::Register(CommandRegistry* registry) {
   registry->StartFamily();
-  *registry << CI{"JSON.GET", CO::READONLY | CO::FAST, -2, 1, 1, 1, acl::JSON}.HFUNC(Get);
-  *registry << CI{"JSON.MGET", CO::READONLY | CO::FAST | CO::REVERSE_MAPPING, -3, 1, -2, 1,
-                  acl::JSON}
+  *registry << CI{"JSON.GET", CO::READONLY | CO::FAST, -2, 1, 1, acl::JSON}.HFUNC(Get);
+  *registry << CI{"JSON.MGET", CO::READONLY | CO::FAST | CO::REVERSE_MAPPING, -3, 1, -2, acl::JSON}
                    .HFUNC(MGet);
-  *registry << CI{"JSON.TYPE", CO::READONLY | CO::FAST, 3, 1, 1, 1, acl::JSON}.HFUNC(Type);
-  *registry << CI{"JSON.STRLEN", CO::READONLY | CO::FAST, 3, 1, 1, 1, acl::JSON}.HFUNC(StrLen);
-  *registry << CI{"JSON.OBJLEN", CO::READONLY | CO::FAST, 3, 1, 1, 1, acl::JSON}.HFUNC(ObjLen);
-  *registry << CI{"JSON.ARRLEN", CO::READONLY | CO::FAST, 3, 1, 1, 1, acl::JSON}.HFUNC(ArrLen);
-  *registry << CI{"JSON.TOGGLE", CO::WRITE | CO::FAST, 3, 1, 1, 1, acl::JSON}.HFUNC(Toggle);
-  *registry << CI{"JSON.NUMINCRBY", CO::WRITE | CO::FAST, 4, 1, 1, 1, acl::JSON}.HFUNC(NumIncrBy);
-  *registry << CI{"JSON.NUMMULTBY", CO::WRITE | CO::FAST, 4, 1, 1, 1, acl::JSON}.HFUNC(NumMultBy);
-  *registry << CI{"JSON.DEL", CO::WRITE, -2, 1, 1, 1, acl::JSON}.HFUNC(Del);
-  *registry << CI{"JSON.FORGET", CO::WRITE, -2, 1, 1, 1, acl::JSON}.HFUNC(
+  *registry << CI{"JSON.TYPE", CO::READONLY | CO::FAST, 3, 1, 1, acl::JSON}.HFUNC(Type);
+  *registry << CI{"JSON.STRLEN", CO::READONLY | CO::FAST, 3, 1, 1, acl::JSON}.HFUNC(StrLen);
+  *registry << CI{"JSON.OBJLEN", CO::READONLY | CO::FAST, 3, 1, 1, acl::JSON}.HFUNC(ObjLen);
+  *registry << CI{"JSON.ARRLEN", CO::READONLY | CO::FAST, 3, 1, 1, acl::JSON}.HFUNC(ArrLen);
+  *registry << CI{"JSON.TOGGLE", CO::WRITE | CO::FAST, 3, 1, 1, acl::JSON}.HFUNC(Toggle);
+  *registry << CI{"JSON.NUMINCRBY", CO::WRITE | CO::FAST, 4, 1, 1, acl::JSON}.HFUNC(NumIncrBy);
+  *registry << CI{"JSON.NUMMULTBY", CO::WRITE | CO::FAST, 4, 1, 1, acl::JSON}.HFUNC(NumMultBy);
+  *registry << CI{"JSON.DEL", CO::WRITE, -2, 1, 1, acl::JSON}.HFUNC(Del);
+  *registry << CI{"JSON.FORGET", CO::WRITE, -2, 1, 1, acl::JSON}.HFUNC(
       Del);  // An alias of JSON.DEL.
-  *registry << CI{"JSON.OBJKEYS", CO::READONLY | CO::FAST, 3, 1, 1, 1, acl::JSON}.HFUNC(ObjKeys);
-  *registry << CI{"JSON.STRAPPEND", CO::WRITE | CO::DENYOOM | CO::FAST, -4, 1, 1, 1, acl::JSON}
-                   .HFUNC(StrAppend);
-  *registry << CI{"JSON.CLEAR", CO::WRITE | CO::FAST, 3, 1, 1, 1, acl::JSON}.HFUNC(Clear);
-  *registry << CI{"JSON.ARRPOP", CO::WRITE | CO::FAST, -3, 1, 1, 1, acl::JSON}.HFUNC(ArrPop);
-  *registry << CI{"JSON.ARRTRIM", CO::WRITE | CO::FAST, 5, 1, 1, 1, acl::JSON}.HFUNC(ArrTrim);
-  *registry << CI{"JSON.ARRINSERT", CO::WRITE | CO::DENYOOM | CO::FAST, -4, 1, 1, 1, acl::JSON}
-                   .HFUNC(ArrInsert);
-  *registry << CI{"JSON.ARRAPPEND", CO::WRITE | CO::DENYOOM | CO::FAST, -4, 1, 1, 1, acl::JSON}
-                   .HFUNC(ArrAppend);
-  *registry << CI{"JSON.ARRINDEX", CO::READONLY | CO::FAST, -4, 1, 1, 1, acl::JSON}.HFUNC(ArrIndex);
+  *registry << CI{"JSON.OBJKEYS", CO::READONLY | CO::FAST, 3, 1, 1, acl::JSON}.HFUNC(ObjKeys);
+  *registry << CI{"JSON.STRAPPEND", CO::WRITE | CO::DENYOOM | CO::FAST, -4, 1, 1, acl::JSON}.HFUNC(
+      StrAppend);
+  *registry << CI{"JSON.CLEAR", CO::WRITE | CO::FAST, 3, 1, 1, acl::JSON}.HFUNC(Clear);
+  *registry << CI{"JSON.ARRPOP", CO::WRITE | CO::FAST, -3, 1, 1, acl::JSON}.HFUNC(ArrPop);
+  *registry << CI{"JSON.ARRTRIM", CO::WRITE | CO::FAST, 5, 1, 1, acl::JSON}.HFUNC(ArrTrim);
+  *registry << CI{"JSON.ARRINSERT", CO::WRITE | CO::DENYOOM | CO::FAST, -4, 1, 1, acl::JSON}.HFUNC(
+      ArrInsert);
+  *registry << CI{"JSON.ARRAPPEND", CO::WRITE | CO::DENYOOM | CO::FAST, -4, 1, 1, acl::JSON}.HFUNC(
+      ArrAppend);
+  *registry << CI{"JSON.ARRINDEX", CO::READONLY | CO::FAST, -4, 1, 1, acl::JSON}.HFUNC(ArrIndex);
   // TODO: Support negative first_key index to revive the debug sub-command
-  *registry << CI{"JSON.DEBUG", CO::READONLY | CO::FAST, -3, 2, 2, 1, acl::JSON}.HFUNC(Debug);
-  *registry << CI{"JSON.RESP", CO::READONLY | CO::FAST, -2, 1, 1, 1, acl::JSON}.HFUNC(Resp);
-  *registry << CI{"JSON.SET", CO::WRITE | CO::DENYOOM | CO::FAST, -4, 1, 1, 1, acl::JSON}.HFUNC(
-      Set);
+  *registry << CI{"JSON.DEBUG", CO::READONLY | CO::FAST, -3, 2, 2, acl::JSON}.HFUNC(Debug);
+  *registry << CI{"JSON.RESP", CO::READONLY | CO::FAST, -2, 1, 1, acl::JSON}.HFUNC(Resp);
+  *registry << CI{"JSON.SET", CO::WRITE | CO::DENYOOM | CO::FAST, -4, 1, 1, acl::JSON}.HFUNC(Set);
 }
 
 }  // namespace dfly

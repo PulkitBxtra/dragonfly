@@ -563,6 +563,7 @@ uint64_t ScanGeneric(uint64_t cursor, const ScanOpts& scan_opts, StringVec* keys
 
   EngineShardSet* ess = shard_set;
   unsigned shard_count = ess->size();
+  constexpr uint64_t kMaxScanTimeMs = 100;
 
   // Dash table returns a cursor with its right byte empty. We will use it
   // for encoding shard index. For now scan has a limitation of 255 shards.
@@ -580,10 +581,17 @@ uint64_t ScanGeneric(uint64_t cursor, const ScanOpts& scan_opts, StringVec* keys
       OpArgs op_args{EngineShard::tlocal(), 0, db_cntx};
       OpScan(op_args, scan_opts, &cursor, keys);
     });
+
     if (cursor == 0) {
       ++sid;
       if (unsigned(sid) == shard_count)
         break;
+    }
+
+    // Break after kMaxScanTimeMs.
+    uint64_t time_now_ms = GetCurrentTimeMs();
+    if (time_now_ms > db_cntx.time_now_ms + kMaxScanTimeMs) {
+      break;
     }
   } while (keys->size() < scan_opts.limit);
 
@@ -1552,8 +1560,7 @@ constexpr uint32_t kTime = FAST;
 constexpr uint32_t kType = KEYSPACE | READ | FAST;
 constexpr uint32_t kDump = KEYSPACE | READ | SLOW;
 constexpr uint32_t kUnlink = KEYSPACE | WRITE | FAST;
-// TODO investigate what stick is
-constexpr uint32_t kStick = SLOW;
+constexpr uint32_t kStick = KEYSPACE | WRITE | FAST;
 constexpr uint32_t kSort = WRITE | SET | SORTEDSET | LIST | SLOW | DANGEROUS;
 constexpr uint32_t kMove = KEYSPACE | WRITE | FAST;
 constexpr uint32_t kRestore = KEYSPACE | WRITE | SLOW | DANGEROUS;
@@ -1563,41 +1570,41 @@ void GenericFamily::Register(CommandRegistry* registry) {
   constexpr auto kSelectOpts = CO::LOADING | CO::FAST | CO::NOSCRIPT;
   registry->StartFamily();
   *registry
-      << CI{"DEL", CO::WRITE, -2, 1, -1, 1, acl::kDel}.HFUNC(Del)
+      << CI{"DEL", CO::WRITE, -2, 1, -1, acl::kDel}.HFUNC(Del)
       /* Redis compatibility:
        * We don't allow PING during loading since in Redis PING is used as
        * failure detection, and a loading server is considered to be
        * not available. */
-      << CI{"PING", CO::FAST, -1, 0, 0, 0, acl::kPing}.HFUNC(Ping)
-      << CI{"ECHO", CO::LOADING | CO::FAST, 2, 0, 0, 0, acl::kEcho}.HFUNC(Echo)
-      << CI{"EXISTS", CO::READONLY | CO::FAST, -2, 1, -1, 1, acl::kExists}.HFUNC(Exists)
-      << CI{"TOUCH", CO::READONLY | CO::FAST, -2, 1, -1, 1, acl::kTouch}.HFUNC(Exists)
-      << CI{"EXPIRE", CO::WRITE | CO::FAST | CO::NO_AUTOJOURNAL, -3, 1, 1, 1, acl::kExpire}.HFUNC(
+      << CI{"PING", CO::FAST, -1, 0, 0, acl::kPing}.HFUNC(Ping)
+      << CI{"ECHO", CO::LOADING | CO::FAST, 2, 0, 0, acl::kEcho}.HFUNC(Echo)
+      << CI{"EXISTS", CO::READONLY | CO::FAST, -2, 1, -1, acl::kExists}.HFUNC(Exists)
+      << CI{"TOUCH", CO::READONLY | CO::FAST, -2, 1, -1, acl::kTouch}.HFUNC(Exists)
+      << CI{"EXPIRE", CO::WRITE | CO::FAST | CO::NO_AUTOJOURNAL, -3, 1, 1, acl::kExpire}.HFUNC(
              Expire)
-      << CI{"EXPIREAT", CO::WRITE | CO::FAST | CO::NO_AUTOJOURNAL, 3, 1, 1, 1, acl::kExpireAt}
-             .HFUNC(ExpireAt)
-      << CI{"PERSIST", CO::WRITE | CO::FAST, 2, 1, 1, 1, acl::kPersist}.HFUNC(Persist)
-      << CI{"KEYS", CO::READONLY, 2, 0, 0, 0, acl::kKeys}.HFUNC(Keys)
-      << CI{"PEXPIREAT", CO::WRITE | CO::FAST | CO::NO_AUTOJOURNAL, 3, 1, 1, 1, acl::kPExpireAt}
-             .HFUNC(PexpireAt)
-      << CI{"PEXPIRE", CO::WRITE | CO::FAST | CO::NO_AUTOJOURNAL, 3, 1, 1, 1, acl::kPExpire}.HFUNC(
+      << CI{"EXPIREAT", CO::WRITE | CO::FAST | CO::NO_AUTOJOURNAL, 3, 1, 1, acl::kExpireAt}.HFUNC(
+             ExpireAt)
+      << CI{"PERSIST", CO::WRITE | CO::FAST, 2, 1, 1, acl::kPersist}.HFUNC(Persist)
+      << CI{"KEYS", CO::READONLY, 2, 0, 0, acl::kKeys}.HFUNC(Keys)
+      << CI{"PEXPIREAT", CO::WRITE | CO::FAST | CO::NO_AUTOJOURNAL, 3, 1, 1, acl::kPExpireAt}.HFUNC(
+             PexpireAt)
+      << CI{"PEXPIRE", CO::WRITE | CO::FAST | CO::NO_AUTOJOURNAL, 3, 1, 1, acl::kPExpire}.HFUNC(
              Pexpire)
-      << CI{"RENAME", CO::WRITE | CO::NO_AUTOJOURNAL, 3, 1, 2, 1, acl::kRename}.HFUNC(Rename)
-      << CI{"RENAMENX", CO::WRITE | CO::NO_AUTOJOURNAL, 3, 1, 2, 1, acl::kRenamNX}.HFUNC(RenameNx)
-      << CI{"SELECT", kSelectOpts, 2, 0, 0, 0, acl::kSelect}.HFUNC(Select)
-      << CI{"SCAN", CO::READONLY | CO::FAST | CO::LOADING, -2, 0, 0, 0, acl::kScan}.HFUNC(Scan)
-      << CI{"TTL", CO::READONLY | CO::FAST, 2, 1, 1, 1, acl::kTTL}.HFUNC(Ttl)
-      << CI{"PTTL", CO::READONLY | CO::FAST, 2, 1, 1, 1, acl::kPTTL}.HFUNC(Pttl)
-      << CI{"FIELDTTL", CO::READONLY | CO::FAST, 3, 1, 1, 1, acl::kFieldTtl}.HFUNC(FieldTtl)
-      << CI{"TIME", CO::LOADING | CO::FAST, 1, 0, 0, 0, acl::kTime}.HFUNC(Time)
-      << CI{"TYPE", CO::READONLY | CO::FAST | CO::LOADING, 2, 1, 1, 1, acl::kType}.HFUNC(Type)
-      << CI{"DUMP", CO::READONLY, 2, 1, 1, 1, acl::kDump}.HFUNC(Dump)
-      << CI{"UNLINK", CO::WRITE, -2, 1, -1, 1, acl::kUnlink}.HFUNC(Del)
-      << CI{"STICK", CO::WRITE, -2, 1, -1, 1, acl::kStick}.HFUNC(Stick)
-      << CI{"SORT", CO::READONLY, -2, 1, 1, 1, acl::kSort}.HFUNC(Sort)
-      << CI{"MOVE", CO::WRITE | CO::GLOBAL_TRANS | CO::NO_AUTOJOURNAL, 3, 1, 1, 1, acl::kMove}
-             .HFUNC(Move)
-      << CI{"RESTORE", CO::WRITE, -4, 1, 1, 1, acl::kRestore}.HFUNC(Restore);
+      << CI{"RENAME", CO::WRITE | CO::NO_AUTOJOURNAL, 3, 1, 2, acl::kRename}.HFUNC(Rename)
+      << CI{"RENAMENX", CO::WRITE | CO::NO_AUTOJOURNAL, 3, 1, 2, acl::kRenamNX}.HFUNC(RenameNx)
+      << CI{"SELECT", kSelectOpts, 2, 0, 0, acl::kSelect}.HFUNC(Select)
+      << CI{"SCAN", CO::READONLY | CO::FAST | CO::LOADING, -2, 0, 0, acl::kScan}.HFUNC(Scan)
+      << CI{"TTL", CO::READONLY | CO::FAST, 2, 1, 1, acl::kTTL}.HFUNC(Ttl)
+      << CI{"PTTL", CO::READONLY | CO::FAST, 2, 1, 1, acl::kPTTL}.HFUNC(Pttl)
+      << CI{"FIELDTTL", CO::READONLY | CO::FAST, 3, 1, 1, acl::kFieldTtl}.HFUNC(FieldTtl)
+      << CI{"TIME", CO::LOADING | CO::FAST, 1, 0, 0, acl::kTime}.HFUNC(Time)
+      << CI{"TYPE", CO::READONLY | CO::FAST | CO::LOADING, 2, 1, 1, acl::kType}.HFUNC(Type)
+      << CI{"DUMP", CO::READONLY, 2, 1, 1, acl::kDump}.HFUNC(Dump)
+      << CI{"UNLINK", CO::WRITE, -2, 1, -1, acl::kUnlink}.HFUNC(Del)
+      << CI{"STICK", CO::WRITE, -2, 1, -1, acl::kStick}.HFUNC(Stick)
+      << CI{"SORT", CO::READONLY, -2, 1, 1, acl::kSort}.HFUNC(Sort)
+      << CI{"MOVE", CO::WRITE | CO::GLOBAL_TRANS | CO::NO_AUTOJOURNAL, 3, 1, 1, acl::kMove}.HFUNC(
+             Move)
+      << CI{"RESTORE", CO::WRITE, -4, 1, 1, acl::kRestore}.HFUNC(Restore);
 }
 
 }  // namespace dfly

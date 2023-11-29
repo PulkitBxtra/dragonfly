@@ -21,6 +21,7 @@ extern "C" {
 #include "base/logging.h"
 #include "base/stl_util.h"
 #include "core/sorted_map.h"
+#include "facade/cmd_arg_parser.h"
 #include "facade/error.h"
 #include "server/blocking_controller.h"
 #include "server/command_registry.h"
@@ -44,6 +45,8 @@ static const char kFromMemberLonglatErr[] =
 static const char kByRadiusBoxErr[] =
     "BYRADIUS and BYBOX options at the same time are not compatible";
 static const char kAscDescErr[] = "ASC and DESC options at the same time are not compatible";
+static const char kStoreTypeErr[] =
+    "STORE and STOREDIST options at the same time are not compatible";
 static const char kScoreNaN[] = "resulting score is not a number (NaN)";
 static const char kFloatRangeErr[] = "min or max is not a float";
 static const char kLexRangeErr[] = "min or max not valid string range item";
@@ -68,6 +71,7 @@ struct GeoPoint {
 using GeoArray = std::vector<GeoPoint>;
 
 enum class Sorting { kUnsorted, kAsc, kDesc };
+enum class GeoStoreType { kNoStore, kStoreHash, kStoreDist };
 struct GeoSearchOpts {
   double conversion = 0;
   uint64_t count = 0;
@@ -76,6 +80,7 @@ struct GeoSearchOpts {
   bool withdist = 0;
   bool withcoord = 0;
   bool withhash = 0;
+  GeoStoreType store = GeoStoreType::kNoStore;
 };
 
 inline zrangespec GetZrangeSpec(bool reverse, const ZSetFamily::ScoreInterval& si) {
@@ -1057,6 +1062,41 @@ struct SetOpArgs {
   bool with_scores = false;
 };
 
+void HandleOpStatus(ConnectionContext* cntx, OpStatus op_status) {
+  switch (op_status) {
+    case OpStatus::INVALID_FLOAT:
+      return (*cntx)->SendError("weight value is not a float", kSyntaxErrType);
+    default:
+      return (*cntx)->SendError(op_status);
+  }
+}
+
+OpResult<ScoredMap> IntersectResults(vector<OpResult<ScoredMap>>& results, AggType agg_type) {
+  ScoredMap result;
+  for (auto& op_res : results) {
+    if (op_res.status() == OpStatus::SKIPPED)
+      continue;
+
+    if (!op_res) {
+      return op_res.status();
+    }
+
+    if (op_res->empty()) {
+      return ScoredMap{};
+    }
+
+    if (result.empty()) {
+      result.swap(op_res.value());
+    } else {
+      InterScoredMap(&result, &op_res.value(), agg_type);
+    }
+
+    if (result.empty())
+      break;
+  }
+  return result;
+}
+
 OpResult<void> FillAggType(string_view agg, SetOpArgs* op_args) {
   if (agg == "SUM") {
     op_args->agg_type = AggType::SUM;
@@ -1160,12 +1200,7 @@ OpResult<SetOpArgs> ParseSetOpArgs(CmdArgList args, bool store) {
 void ZUnionFamilyInternal(CmdArgList args, bool store, ConnectionContext* cntx) {
   OpResult<SetOpArgs> op_args_res = ParseSetOpArgs(args, store);
   if (!op_args_res) {
-    switch (op_args_res.status()) {
-      case OpStatus::INVALID_FLOAT:
-        return (*cntx)->SendError("weight value is not a float", kSyntaxErrType);
-      default:
-        return (*cntx)->SendError(op_args_res.status());
-    }
+    return HandleOpStatus(cntx, op_args_res.status());
   }
   const auto& op_args = *op_args_res;
   if (op_args.num_keys == 0) {
@@ -1968,12 +2003,7 @@ void ZSetFamily::ZInterStore(CmdArgList args, ConnectionContext* cntx) {
   OpResult<SetOpArgs> op_args_res = ParseSetOpArgs(args, true);
 
   if (!op_args_res) {
-    switch (op_args_res.status()) {
-      case OpStatus::INVALID_FLOAT:
-        return (*cntx)->SendError("weight value is not a float", kSyntaxErrType);
-      default:
-        return (*cntx)->SendError(op_args_res.status());
-    }
+    return HandleOpStatus(cntx, op_args_res.status());
   }
   const auto& op_args = *op_args_res;
   if (op_args.num_keys == 0) {
@@ -1990,28 +2020,14 @@ void ZSetFamily::ZInterStore(CmdArgList args, ConnectionContext* cntx) {
   cntx->transaction->Schedule();
   cntx->transaction->Execute(std::move(cb), false);
 
-  ScoredMap result;
-  for (auto& op_res : maps) {
-    if (op_res.status() == OpStatus::SKIPPED)
-      continue;
-
-    if (!op_res)
-      return (*cntx)->SendError(op_res.status());
-
-    if (result.empty()) {
-      result.swap(op_res.value());
-    } else {
-      InterScoredMap(&result, &op_res.value(), op_args.agg_type);
-    }
-
-    if (result.empty())
-      break;
-  }
+  OpResult<ScoredMap> result = IntersectResults(maps, op_args.agg_type);
+  if (!result)
+    return (*cntx)->SendError(result.status());
 
   ShardId dest_shard = Shard(dest_key, maps.size());
   AddResult add_result;
   vector<ScoredMemberView> smvec;
-  for (const auto& elem : result) {
+  for (const auto& elem : result.value()) {
     smvec.emplace_back(elem.second, elem.first);
   }
 
@@ -2027,6 +2043,44 @@ void ZSetFamily::ZInterStore(CmdArgList args, ConnectionContext* cntx) {
   cntx->transaction->Execute(std::move(store_cb), true);
 
   (*cntx)->SendLong(smvec.size());
+}
+
+void ZSetFamily::ZInter(CmdArgList args, ConnectionContext* cntx) {
+  OpResult<SetOpArgs> op_args_res = ParseSetOpArgs(args, false);
+
+  if (!op_args_res) {
+    return HandleOpStatus(cntx, op_args_res.status());
+  }
+  const auto& op_args = *op_args_res;
+  if (op_args.num_keys == 0) {
+    return SendAtLeastOneKeyError(cntx);
+  }
+
+  vector<OpResult<ScoredMap>> maps(shard_set->size(), OpStatus::SKIPPED);
+
+  auto cb = [&](Transaction* t, EngineShard* shard) {
+    maps[shard->shard_id()] = OpInter(shard, t, "", op_args.agg_type, op_args.weights, false);
+    return OpStatus::OK;
+  };
+
+  cntx->transaction->ScheduleSingleHop(std::move(cb));
+
+  OpResult<ScoredMap> result = IntersectResults(maps, op_args.agg_type);
+  if (!result)
+    return (*cntx)->SendError(result.status());
+
+  std::vector<std::pair<std::string, double>> scored_array;
+  scored_array.reserve(result.value().size());
+  for (const auto& elem : result.value()) {
+    scored_array.emplace_back(elem.first, elem.second);
+  }
+
+  std::sort(scored_array.begin(), scored_array.end(),
+            [](const std::pair<std::string, double>& a, const std::pair<std::string, double>& b) {
+              return a.second < b.second;
+            });
+
+  (*cntx)->SendScoredArray(scored_array, op_args_res->with_scores);
 }
 
 void ZSetFamily::ZInterCard(CmdArgList args, ConnectionContext* cntx) {
@@ -2053,28 +2107,14 @@ void ZSetFamily::ZInterCard(CmdArgList args, ConnectionContext* cntx) {
 
   cntx->transaction->ScheduleSingleHop(std::move(cb));
 
-  ScoredMap result;
-  for (auto& op_res : maps) {
-    if (op_res.status() == OpStatus::SKIPPED)
-      continue;
+  OpResult<ScoredMap> result = IntersectResults(maps, AggType::NOOP);
+  if (!result)
+    return (*cntx)->SendError(result.status());
 
-    if (!op_res)
-      return (*cntx)->SendError(op_res.status());
-
-    if (result.empty()) {
-      result.swap(op_res.value());
-    } else {
-      InterScoredMap(&result, &op_res.value(), AggType::NOOP);
-    }
-
-    if (result.empty())
-      break;
-  }
-
-  if (0 < limit && limit < result.size()) {
+  if (0 < limit && limit < result.value().size()) {
     return (*cntx)->SendLong(limit);
   }
-  (*cntx)->SendLong(result.size());
+  (*cntx)->SendLong(result.value().size());
 }
 
 void ZSetFamily::ZPopMax(CmdArgList args, ConnectionContext* cntx) {
@@ -2276,6 +2316,55 @@ void ZSetFamily::ZRem(CmdArgList args, ConnectionContext* cntx) {
     (*cntx)->SendError(kWrongTypeErr);
   } else {
     (*cntx)->SendLong(*result);
+  }
+}
+
+void ZSetFamily::ZRandMember(CmdArgList args, ConnectionContext* cntx) {
+  if (args.size() > 3)
+    return (*cntx)->SendError(WrongNumArgsError("ZRANDMEMBER"));
+
+  ZRangeSpec range_spec;
+  range_spec.interval = IndexInterval(0, -1);
+
+  CmdArgParser parser{args};
+  string_view key = parser.Next();
+
+  bool is_count = parser.HasNext();
+  int count = is_count ? parser.Next<int>() : 1;
+
+  range_spec.params.with_scores = static_cast<bool>(parser.Check("WITHSCORES").IgnoreCase());
+
+  if (parser.HasNext())
+    return (*cntx)->SendError(absl::StrCat("Unsupported option:", string_view(parser.Next())));
+
+  if (auto err = parser.Error(); err)
+    return (*cntx)->SendError(err->MakeReply());
+
+  bool sign = count < 0;
+  range_spec.params.limit = std::abs(count);
+
+  const auto cb = [&](Transaction* t, EngineShard* shard) {
+    return OpRange(range_spec, t->GetOpArgs(shard), key);
+  };
+
+  OpResult<ScoredArray> result = cntx->transaction->ScheduleSingleHopT(cb);
+
+  if (result) {
+    if (sign && !result->empty()) {
+      for (auto i = result->size(); i < range_spec.params.limit; ++i) {
+        // we can return duplicate elements, so first is OK
+        result->push_back(result->front());
+      }
+    }
+    (*cntx)->SendScoredArray(result.value(), range_spec.params.with_scores);
+  } else if (result.status() == OpStatus::KEY_NOTFOUND) {
+    if (is_count) {
+      (*cntx)->SendScoredArray(ScoredArray(), range_spec.params.with_scores);
+    } else {
+      (*cntx)->SendNull();
+    }
+  } else {
+    (*cntx)->SendError(result.status());
   }
 }
 
@@ -2704,6 +2793,9 @@ bool MembersOfAllNeighbors(ConnectionContext* cntx, string_view key, const GeoHa
   if (result_arrays.status() == OpStatus::WRONG_TYPE) {
     (*cntx)->SendError(kWrongTypeErr);
     return false;
+  } else if (result_arrays.status() == OpStatus::KEY_NOTFOUND) {
+    (*cntx)->SendError("Member not found");
+    return false;
   }
 
   // filter potential result list
@@ -2858,8 +2950,7 @@ void ZSetFamily::GeoSearch(CmdArgList args, ConnectionContext* cntx) {
         if (!ParseDouble(ArgS(args, i + 1), &shape.t.radius)) {
           return (*cntx)->SendError(kInvalidFloatErr);
         }
-        string_view unit;
-        unit = ArgS(args, i + 2);
+        string_view unit = ArgS(args, i + 2);
         shape.conversion = ExtractUnit(unit);
         geo_ops.conversion = shape.conversion;
         if (shape.conversion == -1) {
@@ -2881,8 +2972,7 @@ void ZSetFamily::GeoSearch(CmdArgList args, ConnectionContext* cntx) {
         if (!ParseDouble(ArgS(args, i + 2), &shape.t.r.height)) {
           return (*cntx)->SendError(kInvalidFloatErr);
         }
-        string_view unit;
-        unit = ArgS(args, i + 3);
+        string_view unit = ArgS(args, i + 3);
         shape.conversion = ExtractUnit(unit);
         geo_ops.conversion = shape.conversion;
         if (shape.conversion == -1) {
@@ -2938,6 +3028,98 @@ void ZSetFamily::GeoSearch(CmdArgList args, ConnectionContext* cntx) {
   GeoSearchGeneric(cntx, shape, key, geo_ops);
 }
 
+void ZSetFamily::GeoRadiusByMember(CmdArgList args, ConnectionContext* cntx) {
+  GeoShape shape = {};
+  GeoSearchOpts geo_ops;
+  // parse arguments
+  string_view key = ArgS(args, 0);
+  // member to latlong, set shape.xy
+  string_view member = ArgS(args, 1);
+  auto cb = [&](Transaction* t, EngineShard* shard) {
+    return OpScore(t->GetOpArgs(shard), key, member);
+  };
+  OpResult<double> result = cntx->transaction->ScheduleSingleHopT(std::move(cb));
+  if (result.status() == OpStatus::WRONG_TYPE) {
+    return (*cntx)->SendError(kWrongTypeErr);
+  } else if (!result) {
+    return (*cntx)->SendError("Member not found");
+  }
+  ScoreToLongLat(*result, shape.xy);
+
+  if (!ParseDouble(ArgS(args, 2), &shape.t.radius)) {
+    return (*cntx)->SendError(kInvalidFloatErr);
+  }
+  string_view unit = ArgS(args, 3);
+  shape.conversion = ExtractUnit(unit);
+  geo_ops.conversion = shape.conversion;
+  if (shape.conversion == -1) {
+    return (*cntx)->SendError("unsupported unit provided. please use M, KM, FT, MI");
+  }
+  shape.type = CIRCULAR_TYPE;
+  string_view store_key;
+
+  for (size_t i = 4; i < args.size(); ++i) {
+    ToUpper(&args[i]);
+
+    string_view cur_arg = ArgS(args, i);
+    if (cur_arg == "ASC") {
+      if (geo_ops.sorting != Sorting::kUnsorted) {
+        return (*cntx)->SendError(kAscDescErr);
+      } else {
+        geo_ops.sorting = Sorting::kAsc;
+      }
+    } else if (cur_arg == "DESC") {
+      if (geo_ops.sorting != Sorting::kUnsorted) {
+        return (*cntx)->SendError(kAscDescErr);
+      } else {
+        geo_ops.sorting = Sorting::kDesc;
+      }
+    } else if (cur_arg == "COUNT") {
+      if (i + 1 < args.size()) {
+        absl::SimpleAtoi(std::string(ArgS(args, i + 1)), &geo_ops.count);
+        i++;
+      } else {
+        return (*cntx)->SendError(kSyntaxErr);
+      }
+      if (i + 1 < args.size() && ArgS(args, i + 1) == "ANY") {
+        geo_ops.any = true;
+        i++;
+      }
+    } else if (cur_arg == "WITHCOORD") {
+      geo_ops.withcoord = true;
+    } else if (cur_arg == "WITHDIST") {
+      geo_ops.withdist = true;
+    } else if (cur_arg == "WITHHASH") {
+      geo_ops.withhash = true;
+    } else if (cur_arg == "STORE") {
+      if (geo_ops.store != GeoStoreType::kNoStore) {
+        return (*cntx)->SendError(kStoreTypeErr);
+      }
+      if (i + 1 < args.size()) {
+        store_key = ArgS(args, i + 1);
+        geo_ops.store = GeoStoreType::kStoreHash;
+        i++;
+      } else {
+        return (*cntx)->SendError(kSyntaxErr);
+      }
+    } else if (cur_arg == "STOREDIST") {
+      if (geo_ops.store != GeoStoreType::kNoStore) {
+        return (*cntx)->SendError(kStoreTypeErr);
+      }
+      if (i + 1 < args.size()) {
+        store_key = ArgS(args, i + 1);
+        geo_ops.store = GeoStoreType::kStoreDist;
+        i++;
+      } else {
+        return (*cntx)->SendError(kSyntaxErr);
+      }
+    } else {
+      return (*cntx)->SendError(kSyntaxErr);
+    }
+  }
+  GeoSearchGeneric(cntx, shape, key, geo_ops);
+}
+
 #define HFUNC(x) SetHandler(&ZSetFamily::x)
 
 namespace acl {
@@ -2949,12 +3131,14 @@ constexpr uint32_t kZCount = READ | SORTEDSET | FAST;
 constexpr uint32_t kZDiff = READ | SORTEDSET | SLOW;
 constexpr uint32_t kZIncrBy = WRITE | SORTEDSET | FAST;
 constexpr uint32_t kZInterStore = WRITE | SORTEDSET | SLOW;
+constexpr uint32_t kZInter = READ | SORTEDSET | SLOW;
 constexpr uint32_t kZInterCard = WRITE | SORTEDSET | SLOW;
 constexpr uint32_t kZLexCount = READ | SORTEDSET | FAST;
 constexpr uint32_t kZPopMax = WRITE | SORTEDSET | FAST;
 constexpr uint32_t kZPopMin = WRITE | SORTEDSET | FAST;
 constexpr uint32_t kZRem = WRITE | SORTEDSET | FAST;
 constexpr uint32_t kZRange = READ | SORTEDSET | SLOW;
+constexpr uint32_t kZRandMember = READ | SORTEDSET | SLOW;
 constexpr uint32_t kZRank = READ | SORTEDSET | FAST;
 constexpr uint32_t kZRangeByLex = READ | SORTEDSET | SLOW;
 constexpr uint32_t kZRangeByScore = READ | SORTEDSET | SLOW;
@@ -2975,68 +3159,62 @@ constexpr uint32_t kGeoHash = READ | GEO | SLOW;
 constexpr uint32_t kGeoPos = READ | GEO | SLOW;
 constexpr uint32_t kGeoDist = READ | GEO | SLOW;
 constexpr uint32_t kGeoSearch = READ | GEO | SLOW;
+constexpr uint32_t kGeoRadiusByMember = READ | GEO | SLOW;
 }  // namespace acl
 
 void ZSetFamily::Register(CommandRegistry* registry) {
   constexpr uint32_t kStoreMask = CO::WRITE | CO::VARIADIC_KEYS | CO::REVERSE_MAPPING | CO::DENYOOM;
   registry->StartFamily();
   *registry
-      << CI{"ZADD", CO::FAST | CO::WRITE | CO::DENYOOM, -4, 1, 1, 1, acl::kZAdd}.HFUNC(ZAdd)
-      << CI{"BZPOPMIN",
-            CO::WRITE | CO::NOSCRIPT | CO::BLOCKING | CO::NO_AUTOJOURNAL,
-            -3,
-            1,
-            -2,
-            1,
+      << CI{"ZADD", CO::FAST | CO::WRITE | CO::DENYOOM, -4, 1, 1, acl::kZAdd}.HFUNC(ZAdd)
+      << CI{"BZPOPMIN",    CO::WRITE | CO::NOSCRIPT | CO::BLOCKING | CO::NO_AUTOJOURNAL, -3, 1, -2,
             acl::kBZPopMax}
              .HFUNC(BZPopMin)
-      << CI{"BZPOPMAX",
-            CO::WRITE | CO::NOSCRIPT | CO::BLOCKING | CO::NO_AUTOJOURNAL,
-            -3,
-            1,
-            -2,
-            1,
+      << CI{"BZPOPMAX",    CO::WRITE | CO::NOSCRIPT | CO::BLOCKING | CO::NO_AUTOJOURNAL, -3, 1, -2,
             acl::kBZPopMax}
              .HFUNC(BZPopMax)
-      << CI{"ZCARD", CO::FAST | CO::READONLY, 2, 1, 1, 1, acl::kZCard}.HFUNC(ZCard)
-      << CI{"ZCOUNT", CO::FAST | CO::READONLY, 4, 1, 1, 1, acl::kZCount}.HFUNC(ZCount)
-      << CI{"ZDIFF", CO::READONLY | CO::VARIADIC_KEYS, -3, 2, 2, 1, acl::kZDiff}.HFUNC(ZDiff)
-      << CI{"ZINCRBY", CO::FAST | CO::WRITE, 4, 1, 1, 1, acl::kZIncrBy}.HFUNC(ZIncrBy)
-      << CI{"ZINTERSTORE", kStoreMask, -4, 3, 3, 1, acl::kZInterStore}.HFUNC(ZInterStore)
-      << CI{"ZINTERCARD",    CO::READONLY | CO::REVERSE_MAPPING | CO::VARIADIC_KEYS, -3, 2, 2, 1,
+      << CI{"ZCARD", CO::FAST | CO::READONLY, 2, 1, 1, acl::kZCard}.HFUNC(ZCard)
+      << CI{"ZCOUNT", CO::FAST | CO::READONLY, 4, 1, 1, acl::kZCount}.HFUNC(ZCount)
+      << CI{"ZDIFF", CO::READONLY | CO::VARIADIC_KEYS, -3, 2, 2, acl::kZDiff}.HFUNC(ZDiff)
+      << CI{"ZINCRBY", CO::FAST | CO::WRITE, 4, 1, 1, acl::kZIncrBy}.HFUNC(ZIncrBy)
+      << CI{"ZINTERSTORE", kStoreMask, -4, 3, 3, acl::kZInterStore}.HFUNC(ZInterStore)
+      << CI{"ZINTER", kStoreMask, -3, 2, 2, acl::kZInter}.HFUNC(ZInter)
+      << CI{"ZINTERCARD",    CO::READONLY | CO::REVERSE_MAPPING | CO::VARIADIC_KEYS, -3, 2, 2,
             acl::kZInterCard}
              .HFUNC(ZInterCard)
-      << CI{"ZLEXCOUNT", CO::READONLY, 4, 1, 1, 1, acl::kZLexCount}.HFUNC(ZLexCount)
-      << CI{"ZPOPMAX", CO::FAST | CO::WRITE, -2, 1, 1, 1, acl::kZPopMax}.HFUNC(ZPopMax)
-      << CI{"ZPOPMIN", CO::FAST | CO::WRITE, -2, 1, 1, 1, acl::kZPopMin}.HFUNC(ZPopMin)
-      << CI{"ZREM", CO::FAST | CO::WRITE, -3, 1, 1, 1, acl::kZRem}.HFUNC(ZRem)
-      << CI{"ZRANGE", CO::READONLY, -4, 1, 1, 1, acl::kZRange}.HFUNC(ZRange)
-      << CI{"ZRANK", CO::READONLY | CO::FAST, 3, 1, 1, 1, acl::kZRange}.HFUNC(ZRank)
-      << CI{"ZRANGEBYLEX", CO::READONLY, -4, 1, 1, 1, acl::kZRangeByLex}.HFUNC(ZRangeByLex)
-      << CI{"ZRANGEBYSCORE", CO::READONLY, -4, 1, 1, 1, acl::kZRangeByScore}.HFUNC(ZRangeByScore)
-      << CI{"ZSCORE", CO::READONLY | CO::FAST, 3, 1, 1, 1, acl::kZScore}.HFUNC(ZScore)
-      << CI{"ZMSCORE", CO::READONLY | CO::FAST, -3, 1, 1, 1, acl::kZMScore}.HFUNC(ZMScore)
-      << CI{"ZREMRANGEBYRANK", CO::WRITE, 4, 1, 1, 1, acl::kZRemRangeByRank}.HFUNC(ZRemRangeByRank)
-      << CI{"ZREMRANGEBYSCORE", CO::WRITE, 4, 1, 1, 1, acl::kZRemRangeByScore}.HFUNC(
-             ZRemRangeByScore)
-      << CI{"ZREMRANGEBYLEX", CO::WRITE, 4, 1, 1, 1, acl::kZRemRangeByLex}.HFUNC(ZRemRangeByLex)
-      << CI{"ZREVRANGE", CO::READONLY, -4, 1, 1, 1, acl::kZRevRange}.HFUNC(ZRevRange)
-      << CI{"ZREVRANGEBYLEX", CO::READONLY, -4, 1, 1, 1, acl::kZRevRangeByLex}.HFUNC(ZRevRangeByLex)
-      << CI{"ZREVRANGEBYSCORE", CO::READONLY, -4, 1, 1, 1, acl::kZRevRangeByScore}.HFUNC(
+      << CI{"ZLEXCOUNT", CO::READONLY, 4, 1, 1, acl::kZLexCount}.HFUNC(ZLexCount)
+      << CI{"ZPOPMAX", CO::FAST | CO::WRITE, -2, 1, 1, acl::kZPopMax}.HFUNC(ZPopMax)
+      << CI{"ZPOPMIN", CO::FAST | CO::WRITE, -2, 1, 1, acl::kZPopMin}.HFUNC(ZPopMin)
+      << CI{"ZREM", CO::FAST | CO::WRITE, -3, 1, 1, acl::kZRem}.HFUNC(ZRem)
+      << CI{"ZRANGE", CO::READONLY, -4, 1, 1, acl::kZRange}.HFUNC(ZRange)
+      << CI{"ZRANDMEMBER", CO::READONLY, -2, 1, 1, acl::kZRandMember}.HFUNC(ZRandMember)
+      << CI{"ZRANK", CO::READONLY | CO::FAST, 3, 1, 1, acl::kZRange}.HFUNC(ZRank)
+      << CI{"ZRANGEBYLEX", CO::READONLY, -4, 1, 1, acl::kZRangeByLex}.HFUNC(ZRangeByLex)
+      << CI{"ZRANGEBYSCORE", CO::READONLY, -4, 1, 1, acl::kZRangeByScore}.HFUNC(ZRangeByScore)
+      << CI{"ZSCORE", CO::READONLY | CO::FAST, 3, 1, 1, acl::kZScore}.HFUNC(ZScore)
+      << CI{"ZMSCORE", CO::READONLY | CO::FAST, -3, 1, 1, acl::kZMScore}.HFUNC(ZMScore)
+      << CI{"ZREMRANGEBYRANK", CO::WRITE, 4, 1, 1, acl::kZRemRangeByRank}.HFUNC(ZRemRangeByRank)
+      << CI{"ZREMRANGEBYSCORE", CO::WRITE, 4, 1, 1, acl::kZRemRangeByScore}.HFUNC(ZRemRangeByScore)
+      << CI{"ZREMRANGEBYLEX", CO::WRITE, 4, 1, 1, acl::kZRemRangeByLex}.HFUNC(ZRemRangeByLex)
+      << CI{"ZREVRANGE", CO::READONLY, -4, 1, 1, acl::kZRevRange}.HFUNC(ZRevRange)
+      << CI{"ZREVRANGEBYLEX", CO::READONLY, -4, 1, 1, acl::kZRevRangeByLex}.HFUNC(ZRevRangeByLex)
+      << CI{"ZREVRANGEBYSCORE", CO::READONLY, -4, 1, 1, acl::kZRevRangeByScore}.HFUNC(
              ZRevRangeByScore)
-      << CI{"ZREVRANK", CO::READONLY | CO::FAST, 3, 1, 1, 1, acl::kZRevRank}.HFUNC(ZRevRank)
-      << CI{"ZSCAN", CO::READONLY, -3, 1, 1, 1, acl::kZScan}.HFUNC(ZScan)
-      << CI{"ZUNION",    CO::READONLY | CO::REVERSE_MAPPING | CO::VARIADIC_KEYS, -3, 2, 2, 1,
+      << CI{"ZREVRANK", CO::READONLY | CO::FAST, 3, 1, 1, acl::kZRevRank}.HFUNC(ZRevRank)
+      << CI{"ZSCAN", CO::READONLY, -3, 1, 1, acl::kZScan}.HFUNC(ZScan)
+      << CI{"ZUNION",    CO::READONLY | CO::REVERSE_MAPPING | CO::VARIADIC_KEYS, -3, 2, 2,
             acl::kZUnion}
              .HFUNC(ZUnion)
-      << CI{"ZUNIONSTORE", kStoreMask, -4, 3, 3, 1, acl::kZUnionStore}.HFUNC(ZUnionStore)
+      << CI{"ZUNIONSTORE", kStoreMask, -4, 3, 3, acl::kZUnionStore}.HFUNC(ZUnionStore)
 
       // GEO functions
-      << CI{"GEOADD", CO::FAST | CO::WRITE | CO::DENYOOM, -5, 1, 1, 1, acl::kGeoAdd}.HFUNC(GeoAdd)
-      << CI{"GEOHASH", CO::FAST | CO::READONLY, -2, 1, 1, 1, acl::kGeoHash}.HFUNC(GeoHash)
-      << CI{"GEOPOS", CO::FAST | CO::READONLY, -2, 1, 1, 1, acl::kGeoPos}.HFUNC(GeoPos)
-      << CI{"GEODIST", CO::READONLY, -4, 1, 1, 1, acl::kGeoDist}.HFUNC(GeoDist)
-      << CI{"GEOSEARCH", CO::READONLY, -4, 1, 1, 1, acl::kGeoSearch}.HFUNC(GeoSearch);
+      << CI{"GEOADD", CO::FAST | CO::WRITE | CO::DENYOOM, -5, 1, 1, acl::kGeoAdd}.HFUNC(GeoAdd)
+      << CI{"GEOHASH", CO::FAST | CO::READONLY, -2, 1, 1, acl::kGeoHash}.HFUNC(GeoHash)
+      << CI{"GEOPOS", CO::FAST | CO::READONLY, -2, 1, 1, acl::kGeoPos}.HFUNC(GeoPos)
+      << CI{"GEODIST", CO::READONLY, -4, 1, 1, acl::kGeoDist}.HFUNC(GeoDist)
+      << CI{"GEOSEARCH", CO::READONLY, -4, 1, 1, acl::kGeoSearch}.HFUNC(GeoSearch)
+      << CI{"GEORADIUSBYMEMBER", CO::READONLY, -4, 1, 1, acl::kGeoRadiusByMember}.HFUNC(
+             GeoRadiusByMember);
 }
 
 }  // namespace dfly

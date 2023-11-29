@@ -32,10 +32,11 @@ enum CommandOpt : uint32_t {
 
   ADMIN = 1U << 7,  // implies NOSCRIPT,
   NOSCRIPT = 1U << 8,
-  BLOCKING = 1U << 9,  // implies REVERSE_MAPPING
-  HIDDEN = 1U << 10,   // does not show in COMMAND command output
-
+  BLOCKING = 1U << 9,           // implies REVERSE_MAPPING
+  HIDDEN = 1U << 10,            // does not show in COMMAND command output
+  INTERLEAVED_KEYS = 1U << 11,  // keys are interleaved with arguments
   GLOBAL_TRANS = 1U << 12,
+  STORE_LAST_KEY = 1U << 13,  // The command my have a store key as the last argument.
 
   NO_AUTOJOURNAL = 1U << 15,  // Skip automatically logging command to journal inside transaction.
 
@@ -60,7 +61,7 @@ static_assert(!IsEvalKind(""));
 
 };  // namespace CO
 
-// Per thread vector of command stats. Each entry is {cmd_calls, cmd_sum}.
+// Per thread vector of command stats. Each entry is {cmd_calls, cmd_latency_agg in usec}.
 using CmdCallStats = std::pair<uint64_t, uint64_t>;
 
 class CommandId : public facade::CommandId {
@@ -68,7 +69,7 @@ class CommandId : public facade::CommandId {
   // NOTICE: name must be a literal string, otherwise metrics break! (see cmd_stats_map in
   // server_state.h)
   CommandId(const char* name, uint32_t mask, int8_t arity, int8_t first_key, int8_t last_key,
-            int8_t step, uint32_t acl_categories);
+            uint32_t acl_categories);
 
   CommandId(CommandId&&) = default;
 

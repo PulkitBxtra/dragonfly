@@ -287,6 +287,50 @@ async def test_multi_pubsub(async_client):
     assert state, message
 
 
+"""
+Test that pubsub clients who are stuck on backpressure from a slow client (the one in the test doesn't read messages at all)
+will eventually unblock when it disconnects.
+"""
+
+
+@pytest.mark.asyncio
+@pytest.mark.slow
+@dfly_args({"proactor_threads": "1", "subscriber_thread_limit": "100"})
+async def test_publish_stuck(df_server: DflyInstance, async_client: aioredis.Redis):
+    reader, writer = await asyncio.open_connection("127.0.0.1", df_server.port, limit=10)
+    writer.write(b"SUBSCRIBE channel\r\n")
+    await writer.drain()
+
+    async def pub_task():
+        payload = "msg" * 1000
+        p = async_client.pipeline()
+        for _ in range(1000):
+            p.publish("channel", payload)
+        await p.execute()
+
+    publishers = [asyncio.create_task(pub_task()) for _ in range(20)]
+
+    await asyncio.sleep(5)
+
+    # Check we reached the limit
+    pub_bytes = int((await async_client.info())["dispatch_queue_subscriber_bytes"])
+    assert pub_bytes >= 100
+
+    await asyncio.sleep(0.1)
+
+    # Make sure processing is stalled
+    new_pub_bytes = int((await async_client.info())["dispatch_queue_subscriber_bytes"])
+    assert new_pub_bytes == pub_bytes
+
+    writer.write(b"QUIT\r\n")
+    await writer.drain()
+    writer.close()
+
+    # Make sure all publishers unblock eventually
+    for pub in asyncio.as_completed(publishers):
+        await pub
+
+
 @pytest.mark.asyncio
 async def test_subscribers_with_active_publisher(df_server: DflyInstance, max_connections=100):
     # TODO: I am not how to customize the max connections for the pool.
@@ -521,6 +565,31 @@ async def test_squashed_pipeline(async_client: aioredis.Redis):
 async def test_squashed_pipeline_seeder(df_server, df_seeder_factory):
     seeder = df_seeder_factory.create(port=df_server.port, keys=10_000)
     await seeder.run(target_deviation=0.1)
+
+
+"""
+This test makes sure that multi transactions can be integrated into pipeline squashing
+"""
+
+
+@pytest.mark.asyncio
+@dfly_args({"proactor_threads": "4", "pipeline_squash": 1})
+async def test_squashed_pipeline_multi(async_client: aioredis.Redis):
+    p = async_client.pipeline(transaction=False)
+    for _ in range(5):
+        # Series of squashable commands
+        for _ in range(5):
+            p.set("first", "true")
+        # Non-squashable
+        p.info()
+        # Eval without at tx
+        p.execute_command("MULTI")
+        p.set("second", "true")
+        p.execute_command("EXEC")
+        # Finishing sequence
+        for _ in range(5):
+            p.set("third", "true")
+    await p.execute()
 
 
 @pytest.mark.asyncio

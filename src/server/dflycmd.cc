@@ -12,9 +12,11 @@
 #include <optional>
 #include <utility>
 
+#include "absl/cleanup/cleanup.h"
 #include "absl/strings/numbers.h"
 #include "base/flags.h"
 #include "base/logging.h"
+#include "facade/cmd_arg_parser.h"
 #include "facade/dragonfly_connection.h"
 #include "facade/dragonfly_listener.h"
 #include "server/engine_shard_set.h"
@@ -96,6 +98,7 @@ struct TransactionGuard {
 
   Transaction* t;
 };
+
 }  // namespace
 
 DflyCmd::DflyCmd(ServerFamily* server_family) : sf_(server_family) {
@@ -128,7 +131,7 @@ void DflyCmd::Run(CmdArgList args, ConnectionContext* cntx) {
     return StartStable(args, cntx);
   }
 
-  if (sub_cmd == "TAKEOVER" && args.size() == 3) {
+  if (sub_cmd == "TAKEOVER" && (args.size() == 3 || args.size() == 4)) {
     return TakeOver(args, cntx);
   }
 
@@ -214,7 +217,7 @@ void DflyCmd::Thread(CmdArgList args, ConnectionContext* cntx) {
 
   if (args.size() == 1) {  // DFLY THREAD : returns connection thread index and number of threads.
     rb->StartArray(2);
-    rb->SendLong(ProactorBase::GetIndex());
+    rb->SendLong(ProactorBase::me()->GetPoolIndex());
     rb->SendLong(long(pool->size()));
     return;
   }
@@ -227,7 +230,7 @@ void DflyCmd::Thread(CmdArgList args, ConnectionContext* cntx) {
   }
 
   if (num_thread < pool->size()) {
-    if (int(num_thread) != ProactorBase::GetIndex()) {
+    if (int(num_thread) != ProactorBase::me()->GetPoolIndex()) {
       cntx->conn()->Migrate(pool->at(num_thread));
     }
 
@@ -291,6 +294,8 @@ void DflyCmd::Flow(CmdArgList args, ConnectionContext* cntx) {
   std::string_view sync_type = "FULL";
   if (seqid.has_value()) {
     if (sf_->journal()->IsLSNInBuffer(*seqid) || sf_->journal()->GetLsn() == *seqid) {
+      // This does not guarantee the lsn will still be present when DFLY SYNC runs,
+      // replication will be retried if it gets evicted by then.
       flow.start_partial_sync_at = *seqid;
       VLOG(1) << "Partial sync requested from LSN=" << flow.start_partial_sync_at.value()
               << " and is available. (current_lsn=" << sf_->journal()->GetLsn() << ")";
@@ -386,14 +391,19 @@ void DflyCmd::StartStable(CmdArgList args, ConnectionContext* cntx) {
 
 void DflyCmd::TakeOver(CmdArgList args, ConnectionContext* cntx) {
   RedisReplyBuilder* rb = static_cast<RedisReplyBuilder*>(cntx->reply_builder());
-  string_view sync_id_str = ArgS(args, 2);
-  float timeout;
-  if (!absl::SimpleAtof(ArgS(args, 1), &timeout)) {
-    return (*cntx)->SendError(kInvalidIntErr);
-  }
+  CmdArgParser parser{args};
+  parser.Next();
+  float timeout = parser.Next<float>();
   if (timeout < 0) {
     return (*cntx)->SendError("timeout is negative");
   }
+
+  bool save_flag = static_cast<bool>(parser.Check("SAVE").IgnoreCase());
+
+  string_view sync_id_str = parser.Next<std::string_view>();
+
+  if (auto err = parser.Error(); err)
+    return (*cntx)->SendError(err->MakeReply());
 
   VLOG(1) << "Got DFLY TAKEOVER " << sync_id_str << " time out:" << timeout;
 
@@ -413,24 +423,27 @@ void DflyCmd::TakeOver(CmdArgList args, ConnectionContext* cntx) {
   absl::Time start = absl::Now();
   AggregateStatus status;
 
+  sf_->CancelBlockingCommands();
+
   // We need to await for all dispatches to finish: Otherwise a transaction might be scheduled
   // after this function exits but before the actual shutdown.
-  sf_->CancelBlockingCommands();
-  if (!sf_->AwaitDispatches(timeout_dur, [self = cntx->conn()](util::Connection* conn) {
-        // The only command that is currently dispatching should be the takeover command -
-        // so we wait until this is true.
-        return conn != self;
-      })) {
+  if (!sf_->AwaitCurrentDispatches(timeout_dur, cntx->conn())) {
     LOG(WARNING) << "Couldn't wait for commands to finish dispatching. " << timeout_dur;
     status = OpStatus::TIMED_OUT;
   }
-  VLOG(1) << "AwaitDispatches done";
+  VLOG(1) << "AwaitCurrentDispatches done";
 
   // We have this guard to disable expirations: We don't want any writes to the journal after
   // we send the `PING`, and expirations could ruin that.
-  // TODO: Decouple disabling expirations from TransactionGuard because we don't
-  // really need TransactionGuard here.
-  TransactionGuard tg{cntx->transaction, /*disable_expirations=*/true};
+  shard_set->RunBriefInParallel(
+      [](EngineShard* shard) { shard->db_slice().SetExpireAllowed(false); });
+  VLOG(2) << "Disable expiration";
+
+  absl::Cleanup([] {
+    shard_set->RunBriefInParallel(
+        [](EngineShard* shard) { shard->db_slice().SetExpireAllowed(true); });
+    VLOG(2) << "Enable expiration";
+  });
 
   if (*status == OpStatus::OK) {
     auto cb = [&cntx = replica_ptr->cntx, replica_ptr = replica_ptr, timeout_dur, start,
@@ -440,7 +453,10 @@ void DflyCmd::TakeOver(CmdArgList args, ConnectionContext* cntx) {
       shard->journal()->RecordEntry(0, journal::Op::PING, 0, 0, {}, true);
       while (flow->last_acked_lsn < shard->journal()->GetLsn()) {
         if (absl::Now() - start > timeout_dur) {
-          LOG(WARNING) << "Couldn't synchronize with replica for takeover in time.";
+          LOG(WARNING) << "Couldn't synchronize with replica for takeover in time: "
+                       << replica_ptr->address << ":" << replica_ptr->listening_port
+                       << ", last acked: " << flow->last_acked_lsn << ", expecting "
+                       << shard->journal()->GetLsn();
           status = OpStatus::TIMED_OUT;
           return;
         }
@@ -462,8 +478,16 @@ void DflyCmd::TakeOver(CmdArgList args, ConnectionContext* cntx) {
   }
   (*cntx)->SendOk();
 
+  if (save_flag) {
+    VLOG(1) << "Save snapshot after Takeover.";
+    if (auto ec = sf_->DoSave(true); ec) {
+      LOG(WARNING) << "Failed to perform snapshot " << ec.Format();
+    }
+  }
   VLOG(1) << "Takeover accepted, shutting down.";
-  return sf_->ShutdownCmd({}, cntx);
+  std::string save_arg = "NOSAVE";
+  MutableSlice sargs(save_arg);
+  return sf_->ShutdownCmd(CmdArgList(&sargs, 1), cntx);
 }
 
 void DflyCmd::Expire(CmdArgList args, ConnectionContext* cntx) {
@@ -558,15 +582,7 @@ void DflyCmd::FullSyncFb(FlowInfo* flow, Context* cntx) {
   RdbSaver* saver = flow->saver.get();
 
   if (saver->Mode() == SaveMode::SUMMARY || saver->Mode() == SaveMode::SINGLE_SHARD_WITH_SUMMARY) {
-    auto scripts = sf_->script_mgr()->GetAll();
-    StringVec script_bodies;
-    for (auto& [sha, data] : scripts) {
-      // Always send original body (with header & without auto async calls) that determines the sha,
-      // It's stored only if it's different from the post-processed version.
-      string& body = data.orig_body.empty() ? data.body : data.orig_body;
-      script_bodies.push_back(std::move(body));
-    }
-    ec = saver->SaveHeader({script_bodies, {}});
+    ec = saver->SaveHeader(saver->GetGlobalData(&sf_->service()));
   } else {
     ec = saver->SaveHeader({});
   }

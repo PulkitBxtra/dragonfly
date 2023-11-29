@@ -67,6 +67,7 @@ vector<vector<unsigned>> Partition(unsigned num_flows) {
 
 Replica::Replica(string host, uint16_t port, Service* se, std::string_view id)
     : ProtocolClient(std::move(host), port), service_(*se), id_{id} {
+  proactor_ = ProactorBase::me();
 }
 
 Replica::~Replica() {
@@ -100,7 +101,7 @@ error_code Replica::Start(ConnectionContext* cntx) {
 
   // 1. Resolve dns.
   VLOG(1) << "Resolving master DNS";
-  error_code ec = ResolveMasterDns();
+  error_code ec = ResolveHostDns();
   RETURN_ON_ERR(check_connection_error(ec, "could not resolve master dns"));
 
   // 2. Connect socket.
@@ -133,8 +134,11 @@ void Replica::EnableReplication(ConnectionContext* cntx) {
 void Replica::Stop() {
   VLOG(1) << "Stopping replication";
   // Stops the loop in MainReplicationFb.
-  state_mask_.store(0);  // Specifically ~R_ENABLED.
-  cntx_.Cancel();        // Context is fully resposible for cleanup.
+
+  proactor_->Await([this] {
+    cntx_.Cancel();        // Context is fully resposible for cleanup.
+    state_mask_.store(0);  // Specifically ~R_ENABLED.
+  });
 
   waker_.notifyAll();
 
@@ -149,12 +153,12 @@ void Replica::Pause(bool pause) {
   Proactor()->Await([&] { is_paused_ = pause; });
 }
 
-std::error_code Replica::TakeOver(std::string_view timeout) {
+std::error_code Replica::TakeOver(std::string_view timeout, bool save_flag) {
   VLOG(1) << "Taking over";
 
   std::error_code ec;
-  Proactor()->Await(
-      [this, &ec, timeout] { ec = SendNextPhaseRequest(absl::StrCat("TAKEOVER ", timeout)); });
+  auto takeOverCmd = absl::StrCat("TAKEOVER ", timeout, (save_flag ? " SAVE" : ""));
+  Proactor()->Await([this, &ec, cmd = std::move(takeOverCmd)] { ec = SendNextPhaseRequest(cmd); });
 
   // If we successfully taken over, return and let server_family stop the replication.
   return ec;
@@ -175,7 +179,7 @@ void Replica::MainReplicationFb() {
       if (is_paused_)
         continue;
 
-      ec = ResolveMasterDns();
+      ec = ResolveHostDns();
       if (ec) {
         LOG(ERROR) << "Error resolving dns to " << server().host << " " << ec;
         continue;
@@ -367,7 +371,8 @@ error_code Replica::InitiatePSync() {
     io::PrefixSource ps{io_buf.InputBuffer(), Sock()};
 
     // Set LOADING state.
-    CHECK(service_.SwitchState(GlobalState::ACTIVE, GlobalState::LOADING) == GlobalState::LOADING);
+    CHECK(service_.SwitchState(GlobalState::ACTIVE, GlobalState::LOADING).first ==
+          GlobalState::LOADING);
     absl::Cleanup cleanup = [this]() {
       service_.SwitchState(GlobalState::LOADING, GlobalState::ACTIVE);
     };
@@ -457,7 +462,8 @@ error_code Replica::InitiateDflySync() {
   RETURN_ON_ERR(cntx_.SwitchErrorHandler(std::move(err_handler)));
 
   // Make sure we're in LOADING state.
-  CHECK(service_.SwitchState(GlobalState::ACTIVE, GlobalState::LOADING) == GlobalState::LOADING);
+  CHECK(service_.SwitchState(GlobalState::ACTIVE, GlobalState::LOADING).first ==
+        GlobalState::LOADING);
 
   // Start full sync flows.
   state_mask_.fetch_or(R_SYNCING);
@@ -489,6 +495,7 @@ error_code Replica::InitiateDflySync() {
 
     if (num_full_flows == num_df_flows_) {
       JournalExecutor{&service_}.FlushAll();
+      RdbLoader::PerformPreLoad(&service_);
     } else if (num_full_flows == 0) {
       sync_type = "partial";
     } else {
@@ -516,15 +523,17 @@ error_code Replica::InitiateDflySync() {
   if (cntx_.IsCancelled())
     return cntx_.GetError();
 
+  RdbLoader::PerformPostLoad(&service_);
+
   // Send DFLY STARTSTABLE.
   if (auto ec = SendNextPhaseRequest("STARTSTABLE"); ec) {
     return cntx_.ReportError(ec);
   }
 
   // Joining flows and resetting state is done by cleanup.
-
   double seconds = double(absl::ToInt64Milliseconds(absl::Now() - start_time)) / 1000;
   LOG(INFO) << sync_type << " sync finished in " << strings::HumanReadableElapsedTime(seconds);
+
   return cntx_.GetError();
 }
 

@@ -67,7 +67,7 @@ class RdbSnapshot {
 };
 
 struct SaveStagesController : public SaveStagesInputs {
-  SaveStagesController(SaveStagesInputs&& inputs);
+  SaveStagesController(SaveStagesInputs&& input);
 
   ~SaveStagesController();
 
@@ -102,8 +102,6 @@ struct SaveStagesController : public SaveStagesInputs {
   void CloseCb(unsigned index);
 
   void RunStage(void (SaveStagesController::*cb)(unsigned));
-
-  RdbSaver::GlobalData GetGlobalData() const;
 
   size_t GetSaveBuffersSize();
 
