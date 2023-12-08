@@ -133,14 +133,9 @@ ConnectionContext::ConnectionContext(::io::Sink* stream, Connection* owner) : ow
   async_dispatch = false;
   sync_dispatch = false;
   journal_emulated = false;
+  paused = false;
 
   subscriptions = 0;
-}
-
-RedisReplyBuilder* ConnectionContext::operator->() {
-  CHECK(Protocol::REDIS == protocol());
-
-  return static_cast<RedisReplyBuilder*>(rbuilder_.get());
 }
 
 CommandId::CommandId(const char* name, uint32_t mask, int8_t arity, int8_t first_key,

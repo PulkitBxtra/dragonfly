@@ -700,7 +700,7 @@ Test automatic replication of expiry.
 
 @dfly_args({"proactor_threads": 4})
 @pytest.mark.asyncio
-async def test_expiry(df_local_factory, n_keys=1000):
+async def test_expiry(df_local_factory: DflyInstanceFactory, n_keys=1000):
     master = df_local_factory.create()
     replica = df_local_factory.create()
 
@@ -1763,6 +1763,7 @@ async def test_search(df_local_factory):
     ].id == "k0"
 
 
+# @pytest.mark.slow
 @pytest.mark.asyncio
 async def test_client_pause_with_replica(df_local_factory, df_seeder_factory):
     master = df_local_factory.create(proactor_threads=4)

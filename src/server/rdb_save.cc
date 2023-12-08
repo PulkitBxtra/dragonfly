@@ -109,7 +109,9 @@ constexpr size_t kAmask = 4_KB - 1;
 
 }  // namespace
 
-uint8_t RdbObjectType(unsigned type, unsigned compact_enc) {
+uint8_t RdbObjectType(const PrimeValue& pv) {
+  unsigned type = pv.ObjType();
+  unsigned compact_enc = pv.Encoding();
   switch (type) {
     case OBJ_STRING:
       return RDB_TYPE_STRING;
@@ -120,8 +122,12 @@ uint8_t RdbObjectType(unsigned type, unsigned compact_enc) {
     case OBJ_SET:
       if (compact_enc == kEncodingIntSet)
         return RDB_TYPE_SET_INTSET;
-      else if (compact_enc == kEncodingStrMap || compact_enc == kEncodingStrMap2)
-        return RDB_TYPE_SET;
+      else if (compact_enc == kEncodingStrMap || compact_enc == kEncodingStrMap2) {
+        if (((StringSet*)pv.RObjPtr())->ExpirationUsed())
+          return RDB_TYPE_SET_WITH_EXPIRY;
+        else
+          return RDB_TYPE_SET;
+      }
       break;
     case OBJ_ZSET:
       if (compact_enc == OBJ_ENCODING_LISTPACK)
@@ -132,8 +138,12 @@ uint8_t RdbObjectType(unsigned type, unsigned compact_enc) {
     case OBJ_HASH:
       if (compact_enc == kEncodingListPack)
         return RDB_TYPE_HASH_ZIPLIST;
-      else if (compact_enc == kEncodingStrMap2)
-        return RDB_TYPE_HASH;
+      else if (compact_enc == kEncodingStrMap2) {
+        if (((StringMap*)pv.RObjPtr())->ExpirationUsed())
+          return RDB_TYPE_HASH_WITH_EXPIRY;  // Incompatible with Redis
+        else
+          return RDB_TYPE_HASH;
+      }
       break;
     case OBJ_STREAM:
       return RDB_TYPE_STREAM_LISTPACKS;
@@ -293,9 +303,7 @@ io::Result<uint8_t> RdbSerializer::SaveEntry(const PrimeKey& pk, const PrimeValu
   }
 
   string_view key = pk.GetSlice(&tmp_str_);
-  unsigned obj_type = pv.ObjType();
-  unsigned encoding = pv.Encoding();
-  uint8_t rdb_type = RdbObjectType(obj_type, encoding);
+  uint8_t rdb_type = RdbObjectType(pv);
 
   DVLOG(3) << ((void*)this) << ": Saving key/val start " << key << " in dbid=" << dbid;
 
@@ -416,8 +424,14 @@ error_code RdbSerializer::SaveSetObject(const PrimeValue& obj) {
 
     RETURN_ON_ERR(SaveLen(set->SizeSlow()));
 
-    for (sds ele : *set) {
-      RETURN_ON_ERR(SaveString(string_view{ele, sdslen(ele)}));
+    for (auto it = set->begin(); it != set->end(); ++it) {
+      RETURN_ON_ERR(SaveString(string_view{*it, sdslen(*it)}));
+      if (set->ExpirationUsed()) {
+        int64_t expiry = -1;
+        if (it.HasExpiry())
+          expiry = it.ExpiryTime();
+        RETURN_ON_ERR(SaveLongLongAsString(expiry));
+      }
     }
   } else {
     CHECK_EQ(obj.Encoding(), kEncodingIntSet);
@@ -438,9 +452,16 @@ error_code RdbSerializer::SaveHSetObject(const PrimeValue& pv) {
 
     RETURN_ON_ERR(SaveLen(string_map->SizeSlow()));
 
-    for (const auto& k_v : *string_map) {
-      RETURN_ON_ERR(SaveString(string_view{k_v.first, sdslen(k_v.first)}));
-      RETURN_ON_ERR(SaveString(string_view{k_v.second, sdslen(k_v.second)}));
+    for (auto it = string_map->begin(); it != string_map->end(); ++it) {
+      const auto& [k, v] = *it;
+      RETURN_ON_ERR(SaveString(string_view{k, sdslen(k)}));
+      RETURN_ON_ERR(SaveString(string_view{v, sdslen(v)}));
+      if (string_map->ExpirationUsed()) {
+        int64_t expiry = -1;
+        if (it.HasExpiry())
+          expiry = it.ExpiryTime();
+        RETURN_ON_ERR(SaveLongLongAsString(expiry));
+      }
     }
   } else {
     CHECK_EQ(kEncodingListPack, pv.Encoding());
@@ -902,11 +923,15 @@ class RdbSaver::Impl {
     SliceSnapshot::DbRecord record_holder;
   };
 
+  void CleanShardSnapshots();
+
  public:
   // We pass K=sz to say how many producers are pushing data in order to maintain
   // correct closing semantics - channel is closing when K producers marked it as closed.
   Impl(bool align_writes, unsigned producers_len, CompressionMode compression_mode,
        SaveMode save_mode, io::Sink* sink);
+
+  ~Impl();
 
   void StartSnapshotting(bool stream_journal, const Cancellation* cll, EngineShard* shard);
   void StartIncrementalSnapshotting(Context* cntx, EngineShard* shard, LSN start_lsn);
@@ -975,6 +1000,27 @@ RdbSaver::Impl::Impl(bool align_writes, unsigned producers_len, CompressionMode 
   }
 
   DCHECK(producers_len > 0 || channel_.IsClosing());
+}
+
+void RdbSaver::Impl::CleanShardSnapshots() {
+  if (shard_snapshots_.empty()) {
+    return;
+  }
+
+  auto cb = [this](ShardId sid) {
+    // Destroy SliceSnapshot in target thread, as it registers itself in a thread local set.
+    shard_snapshots_[sid].reset();
+  };
+
+  if (shard_snapshots_.size() == 1) {
+    cb(0);
+  } else {
+    shard_set->RunBlockingInParallel([&](EngineShard* es) { cb(es->shard_id()); });
+  }
+}
+
+RdbSaver::Impl::~Impl() {
+  CleanShardSnapshots();
 }
 
 error_code RdbSaver::Impl::SaveAuxFieldStrStr(string_view key, string_view val) {

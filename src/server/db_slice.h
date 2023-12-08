@@ -323,7 +323,7 @@ class DbSlice {
                           ConnectionState::ExecInfo* exec_info);
 
   // Unregisted all watched key entries for connection.
-  void UnregisterConnectionWatches(ConnectionState::ExecInfo* exec_info);
+  void UnregisterConnectionWatches(const ConnectionState::ExecInfo* exec_info);
 
   void SetDocDeletionCallback(DocDeletionCallback ddcb);
 
@@ -344,6 +344,7 @@ class DbSlice {
                                                      bool force_update) noexcept(false);
 
   void FlushSlotsFb(const SlotSet& slot_ids);
+  void FlushDbIndexes(const std::vector<DbIndex>& indexes);
 
   // Invalidate all watched keys in database. Used on FLUSH.
   void InvalidateDbWatches(DbIndex db_indx);
